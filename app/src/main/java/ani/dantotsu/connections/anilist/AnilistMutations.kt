@@ -7,6 +7,8 @@ import ani.dantotsu.currContext
 import com.google.gson.Gson
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.*
+import kotlinx.serialization.json.JsonPrimitive
 
 class AnilistMutations {
 
@@ -16,6 +18,91 @@ class AnilistMutations {
         val variables = if (anime) """{"animeId":"$id"}""" else """{"mangaId":"$id"}"""
         executeQuery<JsonObject>(query, variables)
     }
+        suspend inline fun <reified T : Any> executeQuery(
+        query: String,
+        variables: String = "",
+        force: Boolean = false,
+        useToken: Boolean = true,
+        show: Boolean = false,
+        cache: Int? = null
+    ): T? {
+        return try {
+            // Attempt AniList query first
+            if (show) Logger.log("Anilist Query: $query")
+            val aniListResult = executeAniListQuery<T>(query, variables, force, useToken, show, cache)
+            aniListResult ?: throw Exception("AniList query failed, switching to Jikan fallback.")
+        } catch (e: Exception) {
+            // Fallback to Jikan API if AniList query fails
+            if (show) snackString("Falling back to Jikan API")
+            Logger.log("Falling back to Jikan API for query: $query due to error: ${e.message}")
+            executeJikanFallback<T>(query, show)
+        }
+    }
+
+    private suspend inline fun <reified T : Any> executeAniListQuery(
+        query: String,
+        variables: String,
+        force: Boolean,
+        useToken: Boolean,
+        show: Boolean,
+        cache: Int?
+    ): T? {
+        // AniList API request setup (similar to original method)
+        val data = mapOf("query" to query, "variables" to variables)
+        val headers = mutableMapOf(
+            "Content-Type" to "application/json; charset=utf-8",
+            "Accept" to "application/json"
+        )
+        if (token != null && useToken) headers["Authorization"] = "Bearer $token"
+
+        val json = client.post(
+            "https://graphql.anilist.co/",
+            headers,
+            data = data,
+            cacheTime = cache ?: 10
+        )
+        
+        if (json.code == 429) {
+            rateLimitReset = json.headers["X-RateLimit-Reset"]?.toLongOrNull() ?: 0
+            throw Exception("Rate limited after ${json.headers["Retry-After"]?.toIntOrNull() ?: -1} seconds")
+        }
+        if (!json.text.startsWith("{")) throw Exception(currContext()?.getString(R.string.anilist_down))
+
+        return json.parsed()
+    }
+
+    private suspend inline fun <reified T : Any> executeJikanFallback(
+        query: String,
+        show: Boolean
+    ): T? {
+        // Jikan fallback setup (e.g., for top anime or seasonal anime)
+        val jikanUrl = "https://api.jikan.moe/v4/top/anime"  // example URL
+        val jikanJson = client.get(jikanUrl)
+
+        if (show) Logger.log("Jikan API Response: ${jikanJson.text}")
+        
+        val jikanData = jikanJson.parsed<JsonObject>()
+        val transformedData = transformJikanToAniListFormat(jikanData)
+        return transformedData?.let { Json.decodeFromJsonElement(it) }
+    }
+
+    private fun transformJikanToAniListFormat(jikanData: JsonObject): JsonObject? {
+        val animeList = jikanData["data"]?.jsonArray?.map { anime ->
+            JsonObject(
+                mapOf(
+                    "id" to anime.jsonObject["mal_id"]!!,
+                    "title" to anime.jsonObject["title"]!!,
+                    "popularity" to anime.jsonObject["members"]!!,
+                    "episodes" to anime.jsonObject["episodes"] ?: JsonNull,
+                    "status" to JsonPrimitive("RELEASING"),
+                    "start_date" to anime.jsonObject["aired"]?.jsonObject?.get("from") ?: JsonNull
+                )
+            )
+        } ?: return null
+
+        return JsonObject(mapOf("data" to JsonObject(mapOf("Page" to JsonObject(mapOf("media" to JsonArray(animeList))))))
+    }
+}
 
     suspend fun toggleFav(type: FavType, id: Int): Boolean {
         val filter = when (type) {
